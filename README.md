@@ -14,7 +14,7 @@ The UI and HTMX runtime are embedded in the compiled binary, so no separate fron
 - HTTPS by default with automatically generated or supplied certificates
 
 ## Requirements
-- Go 1.20 (as declared in `go.mod`)
+- Go 1.26.4. The module toolchain directive automatically selects this patched release when Go toolchain downloads are enabled.
 
 ## CLI Flags
 - `-p` : port to bind to (default `8080`)
