@@ -25,10 +25,12 @@ func TestEmbeddedSPAAndHTMXAsset(t *testing.T) {
 		t.Fatalf("expected embedded HTMX application shell, got %q", body)
 	}
 
-	asset := httptest.NewRecorder()
-	app.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/assets/htmx.min.js", nil))
-	if asset.Code != http.StatusOK || asset.Body.Len() < 1000 {
-		t.Fatalf("expected embedded HTMX asset, got status %d and %d bytes", asset.Code, asset.Body.Len())
+	for _, assetPath := range []string{"/assets/htmx.min.js", "/assets/app.js"} {
+		asset := httptest.NewRecorder()
+		app.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, assetPath, nil))
+		if asset.Code != http.StatusOK || asset.Body.Len() < 500 {
+			t.Fatalf("expected embedded asset %s, got status %d and %d bytes", assetPath, asset.Code, asset.Body.Len())
+		}
 	}
 }
 
@@ -185,6 +187,70 @@ func TestUploadLimitAndOriginChecks(t *testing.T) {
 	}
 }
 
+func TestConcurrentUploadSlots(t *testing.T) {
+	app := &fileApp{uploadSlots: make(chan struct{}, 2)}
+	if !app.acquireUploadSlot() || !app.acquireUploadSlot() {
+		t.Fatal("expected configured upload slots to be available")
+	}
+	if app.acquireUploadSlot() {
+		t.Fatal("expected upload above concurrency limit to be rejected")
+	}
+	response := httptest.NewRecorder()
+	app.handleUpload(response, httptest.NewRequest(http.MethodPost, "/api/upload", nil))
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected HTTP 429 with retry guidance, got %d", response.Code)
+	}
+	app.releaseUploadSlot()
+	if !app.acquireUploadSlot() {
+		t.Fatal("expected released upload slot to become available")
+	}
+}
+
+func TestStorageLimitRejectsUpload(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "existing.txt"), []byte("123456"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app, err := newFileApp(root, 1<<20, 2, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	app.ServeHTTP(response, multipartRequest(t, "/api/upload", "", "new.txt", []byte("12345")))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "storage limit") {
+		t.Fatalf("expected storage quota warning, got status %d and body %q", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "new.txt")); !os.IsNotExist(err) {
+		t.Fatal("file should not be created when storage quota is exceeded")
+	}
+}
+
+func TestFolderSizeCountsNestedFilesAndSkipsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "one.txt"), []byte("123"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "two.txt"), []byte("4567"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "one.txt"), filepath.Join(root, "duplicate.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	size, err := folderSize(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 7 {
+		t.Fatalf("expected 7 bytes of stored files, got %d", size)
+	}
+}
+
 func TestGenerateSelfSignedCertSecuresKey(t *testing.T) {
 	root := t.TempDir()
 	certPath := filepath.Join(root, "cert", "server.pem")
@@ -259,7 +325,7 @@ func TestEnsureTLSCertificateRejectsInvalidPair(t *testing.T) {
 
 func testFileApp(t *testing.T, root string, maxUploadBytes int64) http.Handler {
 	t.Helper()
-	handler, err := newFileApp(root, maxUploadBytes)
+	handler, err := newFileApp(root, maxUploadBytes, 4, 10<<30)
 	if err != nil {
 		t.Fatal(err)
 	}

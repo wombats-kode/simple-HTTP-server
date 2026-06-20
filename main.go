@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -37,6 +38,8 @@ func main() {
 	genCert := flag.Bool("gencert", false, "generate a self-signed cert/key and exit")
 	host := flag.String("host", "127.0.0.1", "host/interface to bind to")
 	maxUploadMB := flag.Int64("max-upload", 100, "maximum upload request size in MB")
+	maxConcurrentUploads := flag.Int("max-concurrent-uploads", 4, "maximum number of uploads processed concurrently")
+	maxStorageMB := flag.Int64("max-storage", 10*1024, "maximum shared folder size in MB")
 
 	flag.Usage = func() {
 		fmt.Println("Serve is an HTTPS file server used to share files from a local folder ('static' by default).")
@@ -62,6 +65,18 @@ func main() {
 	if *maxUploadMB < 1 {
 		log.Fatal("max-upload has to be at least 1 MB")
 	}
+	if *maxUploadMB > math.MaxInt64>>20 {
+		log.Fatal("max-upload is too large")
+	}
+	if *maxConcurrentUploads < 1 {
+		log.Fatal("max-concurrent-uploads has to be at least 1")
+	}
+	if *maxStorageMB < 1 {
+		log.Fatal("max-storage has to be at least 1 MB")
+	}
+	if *maxStorageMB > math.MaxInt64>>20 {
+		log.Fatal("max-storage is too large")
+	}
 
 	// Directory has to exist and be accessible
 	cleanedDir := filepath.Clean(*directory)
@@ -86,7 +101,7 @@ func main() {
 		*urlToken = fmt.Sprintf("/%s/", token)
 	}
 
-	handler, err := newFileApp(cleanedDir, *maxUploadMB<<20)
+	handler, err := newFileApp(cleanedDir, *maxUploadMB<<20, *maxConcurrentUploads, *maxStorageMB<<20)
 	if err != nil {
 		log.Fatalf("failed to prepare folder %q: %v", cleanedDir, err)
 	}

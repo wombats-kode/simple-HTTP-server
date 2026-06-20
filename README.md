@@ -9,7 +9,7 @@ The UI and HTMX runtime are embedded in the compiled binary, so no separate fron
 - Multi-file uploads into the current folder
 - Explicit download links with attachment headers
 - Subfolder navigation without full-page reloads
-- Configurable upload limit; existing files are never overwritten
+- Configurable request, concurrency, and shared-folder storage limits
 - Embedded HTMX 2.0.10 and HTML/CSS assets
 - HTTPS by default with automatically generated or supplied certificates
 
@@ -26,6 +26,8 @@ The UI and HTMX runtime are embedded in the compiled binary, so no separate fron
 - `-gencert` : generate a self-signed certificate and key at the `-cert`/`-key` paths, then exit
 - `-host` : host/interface to bind to (default `127.0.0.1`); use `0.0.0.0` to listen on all interfaces
 - `-max-upload` : maximum total size of one upload request in MB (default `100`)
+- `-max-concurrent-uploads` : maximum uploads processed at once (default `4`)
+- `-max-storage` : maximum total size of regular files in the shared folder, including subfolders, in MB (default `10240`, or 10 GiB)
 
 Notes:
 - The `-url` token must be a non-empty alphanumeric string. The server will normalize it to a path that starts and ends with `/` (e.g. `/token/`).
@@ -54,10 +56,10 @@ make run
 
 Then open `https://127.0.0.1:8080`. Your browser will warn about the automatically generated self-signed certificate; this is expected for local use.
 
-Share another folder, allow access from the local network, and limit each upload request to 250 MB:
+Share another folder, allow access from the local network, limit each upload request to 250 MB, and cap storage at 20 GiB:
 
 ```bash
-./bin/serve -dir=/path/to/documents -host=0.0.0.0 -max-upload=250
+./bin/serve -dir=/path/to/documents -host=0.0.0.0 -max-upload=250 -max-storage=20480
 ```
 
 Mount the application under a private-looking URL path:
@@ -96,7 +98,8 @@ openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 - For production use, provide certificates from a trusted CA with `-cert` and `-key`.
 - The server listens only on localhost by default. Binding to `0.0.0.0` makes the served files available to other devices allowed by your firewall and network configuration.
 - The `-url` option changes the path but is not authentication. Do not rely on it to protect sensitive files.
-- Uploads are limited by `-max-upload`, constrained to the shared folder, and rejected when a destination file already exists.
+- Uploads are bounded by `-max-upload` and `-max-concurrent-uploads`, constrained to the shared folder, and rejected when a destination file already exists.
+- Before committing an upload, the server measures regular files under the shared folder and rejects the batch if it would exceed `-max-storage`. Symlinks are excluded from this calculation.
 - Symlinks that resolve outside the shared folder are not listed or downloadable.
 - Avoid running the binary as root to bind privileged ports; instead use a reverse proxy or appropriate capability tools.
 

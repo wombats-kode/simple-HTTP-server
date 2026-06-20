@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -14,10 +16,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
-//go:embed web/index.html web/htmx.min.js
+//go:embed web/index.html web/htmx.min.js web/app.js
 var webFiles embed.FS
 
 var appTemplates = template.Must(template.New("app").Funcs(template.FuncMap{
@@ -25,8 +28,11 @@ var appTemplates = template.Must(template.New("app").Funcs(template.FuncMap{
 }).ParseFS(webFiles, "web/index.html"))
 
 type fileApp struct {
-	root           string
-	maxUploadBytes int64
+	root            string
+	maxUploadBytes  int64
+	maxStorageBytes int64
+	uploadSlots     chan struct{}
+	storageMu       sync.Mutex
 }
 
 type browserData struct {
@@ -37,6 +43,7 @@ type browserData struct {
 	Message     string
 	Error       string
 	MaxUpload   string
+	MaxStorage  string
 }
 
 type breadcrumb struct {
@@ -57,7 +64,10 @@ type pendingUpload struct {
 	destination string
 }
 
-func newFileApp(root string, maxUploadBytes int64) (http.Handler, error) {
+func newFileApp(root string, maxUploadBytes int64, maxConcurrentUploads int, maxStorageBytes int64) (http.Handler, error) {
+	if maxUploadBytes < 1 || maxConcurrentUploads < 1 || maxStorageBytes < 1 {
+		return nil, fmt.Errorf("upload and storage limits must be positive")
+	}
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve absolute root path: %w", err)
@@ -67,10 +77,16 @@ func newFileApp(root string, maxUploadBytes int64) (http.Handler, error) {
 		return nil, fmt.Errorf("resolve root symlinks: %w", err)
 	}
 
-	app := &fileApp{root: resolvedRoot, maxUploadBytes: maxUploadBytes}
+	app := &fileApp{
+		root:            resolvedRoot,
+		maxUploadBytes:  maxUploadBytes,
+		maxStorageBytes: maxStorageBytes,
+		uploadSlots:     make(chan struct{}, maxConcurrentUploads),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.handleIndex)
 	mux.HandleFunc("/assets/htmx.min.js", app.handleHTMX)
+	mux.HandleFunc("/assets/app.js", app.handleAppJS)
 	mux.HandleFunc("/api/files", app.handleFiles)
 	mux.HandleFunc("/api/upload", app.handleUpload)
 	mux.HandleFunc("/download", app.handleDownload)
@@ -94,11 +110,19 @@ func (app *fileApp) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *fileApp) handleHTMX(w http.ResponseWriter, r *http.Request) {
+	app.serveJavaScript(w, r, "web/htmx.min.js")
+}
+
+func (app *fileApp) handleAppJS(w http.ResponseWriter, r *http.Request) {
+	app.serveJavaScript(w, r, "web/app.js")
+}
+
+func (app *fileApp) serveJavaScript(w http.ResponseWriter, r *http.Request, assetPath string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodHead)
 		return
 	}
-	content, err := webFiles.ReadFile("web/htmx.min.js")
+	content, err := webFiles.ReadFile(assetPath)
 	if err != nil {
 		http.Error(w, "embedded asset unavailable", http.StatusInternalServerError)
 		return
@@ -127,6 +151,12 @@ func (app *fileApp) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cross-origin uploads are not allowed", http.StatusForbidden)
 		return
 	}
+	if !app.acquireUploadSlot() {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "too many uploads are currently in progress", http.StatusTooManyRequests)
+		return
+	}
+	defer app.releaseUploadSlot()
 
 	r.Body = http.MaxBytesReader(w, r.Body, app.maxUploadBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
@@ -183,19 +213,12 @@ func (app *fileApp) handleUpload(w http.ResponseWriter, r *http.Request) {
 		pending = append(pending, pendingUpload{header: header, destination: destination})
 	}
 
-	created := make([]string, 0, len(pending))
-	for _, upload := range pending {
-		if err := saveUpload(upload.header, upload.destination); err != nil {
-			for _, createdPath := range created {
-				os.Remove(createdPath)
-			}
-			app.renderBrowser(w, normalized, "", err.Error())
-			return
-		}
-		created = append(created, upload.destination)
+	uploaded, err := app.commitUploads(pending)
+	if err != nil {
+		app.renderBrowser(w, normalized, "", err.Error())
+		return
 	}
 
-	uploaded := len(created)
 	message := fmt.Sprintf("Uploaded %d file.", uploaded)
 	if uploaded != 1 {
 		message = fmt.Sprintf("Uploaded %d files.", uploaded)
@@ -288,9 +311,79 @@ func (app *fileApp) renderBrowser(w http.ResponseWriter, requested, message, err
 		Message:     message,
 		Error:       errorMessage,
 		MaxUpload:   humanSize(app.maxUploadBytes),
+		MaxStorage:  humanSize(app.maxStorageBytes),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	return appTemplates.ExecuteTemplate(w, "browser", data)
+}
+
+func (app *fileApp) acquireUploadSlot() bool {
+	select {
+	case app.uploadSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (app *fileApp) releaseUploadSlot() {
+	<-app.uploadSlots
+}
+
+func (app *fileApp) commitUploads(pending []pendingUpload) (int, error) {
+	app.storageMu.Lock()
+	defer app.storageMu.Unlock()
+
+	currentSize, err := folderSize(app.root)
+	if err != nil {
+		return 0, fmt.Errorf("unable to calculate shared folder usage")
+	}
+	uploadSize := int64(0)
+	for _, upload := range pending {
+		if upload.header.Size < 0 || upload.header.Size > app.maxStorageBytes-uploadSize {
+			return 0, fmt.Errorf("the selected files exceed the shared folder storage limit")
+		}
+		uploadSize += upload.header.Size
+	}
+	if currentSize > app.maxStorageBytes-uploadSize {
+		return 0, fmt.Errorf("upload would exceed the shared folder storage limit of %s", humanSize(app.maxStorageBytes))
+	}
+
+	created := make([]string, 0, len(pending))
+	for _, upload := range pending {
+		if err := saveUpload(upload.header, upload.destination); err != nil {
+			for _, createdPath := range created {
+				os.Remove(createdPath)
+			}
+			return 0, err
+		}
+		created = append(created, upload.destination)
+	}
+	return len(created), nil
+}
+
+func folderSize(root string) (int64, error) {
+	total := int64(0)
+	err := filepath.WalkDir(root, func(_ string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			if info.Size() > math.MaxInt64-total {
+				return fmt.Errorf("shared folder size overflow")
+			}
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
 }
 
 func (app *fileApp) resolveExisting(requested string) (string, string, error) {

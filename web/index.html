@@ -7,6 +7,7 @@
   <meta name="color-scheme" content="light dark">
   <title>File Shuttle</title>
   <script src="assets/htmx.min.js" defer></script>
+  <script src="assets/app.js" defer></script>
   <style>
     :root {
       color-scheme: light;
@@ -48,11 +49,22 @@
     .crumb { border: 0; padding: 3px 5px; color: var(--primary); background: transparent; cursor: pointer; font-weight: 650; }
     .crumb:hover { text-decoration: underline; }
     .separator { color: #a0a8b9; }
-    .upload { display: flex; align-items: center; gap: 10px; }
-    .file-input { max-width: 250px; color: var(--muted); }
-    .file-input::file-selector-button {
-      margin-right: 10px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); color: var(--text); cursor: pointer;
+    .upload { display: grid; grid-template-columns: minmax(250px, 1fr) auto; align-items: start; gap: 10px; min-width: min(100%, 430px); }
+    .file-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+    .file-picker {
+      display: flex; align-items: center; gap: 12px; min-height: 54px; padding: 9px 13px; border: 1px dashed #aeb9d2;
+      border-radius: 13px; background: var(--surface-soft); cursor: pointer; transition: border-color .15s ease, background .15s ease;
     }
+    .file-picker:hover, .file-picker:focus-within { border-color: var(--primary); background: #f3f6ff; }
+    .picker-icon { display: grid; place-items: center; width: 34px; height: 34px; flex: 0 0 auto; border-radius: 10px; color: var(--primary); background: #e8edff; font-size: 18px; }
+    .picker-copy { min-width: 0; }
+    .picker-title { display: block; overflow: hidden; color: var(--text); font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+    .picker-detail { display: block; overflow: hidden; margin-top: 1px; color: var(--muted); font-size: .8rem; text-overflow: ellipsis; white-space: nowrap; }
+    .selected-files { grid-column: 1 / -1; display: none; gap: 6px; margin: 0; padding: 0; list-style: none; }
+    .selected-files.has-files { display: grid; }
+    .selected-file { display: flex; justify-content: space-between; gap: 16px; padding: 7px 10px; border-radius: 9px; color: var(--muted); background: #f1f4fa; font-size: .8rem; }
+    .selected-name { overflow: hidden; color: var(--text); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .selected-size { flex: 0 0 auto; }
     .button {
       display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 8px 16px;
       border: 0; border-radius: 11px; background: var(--primary); color: #fff; cursor: pointer; font-weight: 700;
@@ -84,8 +96,8 @@
     @media (max-width: 760px) {
       .page { width: min(100% - 20px, 1120px); padding: 28px 0; }
       .toolbar { align-items: stretch; flex-direction: column; }
-      .upload { align-items: stretch; flex-direction: column; }
-      .file-input { max-width: none; width: 100%; }
+      .upload { grid-template-columns: 1fr; min-width: 0; width: 100%; }
+      .selected-files { grid-column: 1; }
       th, td { padding: 13px 16px; }
       .modified-column { display: none; }
     }
@@ -119,8 +131,16 @@
     </nav>
     <form class="upload" hx-post="api/upload" hx-encoding="multipart/form-data" hx-target="#browser" hx-swap="outerHTML" hx-disabled-elt="button">
       <input type="hidden" name="path" value="{{.Current}}">
-      <input class="file-input" type="file" name="files" multiple required aria-label="Choose files to upload">
+      <label class="file-picker">
+        <input class="file-input" type="file" name="files" multiple required aria-label="Choose files to upload">
+        <span class="picker-icon" aria-hidden="true">＋</span>
+        <span class="picker-copy">
+          <span class="picker-title">Choose files</span>
+          <span class="picker-detail">No files selected</span>
+        </span>
+      </label>
       <button class="button" type="submit">Upload <span class="htmx-indicator">…</span></button>
+      <ul class="selected-files" aria-live="polite"></ul>
     </form>
   </div>
 
@@ -158,6 +178,6 @@
   {{else}}
     <div class="empty"><strong>This folder is empty</strong>Choose files above to add documents.</div>
   {{end}}
-  <div class="hint">Maximum upload request: {{.MaxUpload}}. Existing files are never overwritten.</div>
+  <div class="hint">Maximum upload request: {{.MaxUpload}} · Shared folder limit: {{.MaxStorage}} · Existing files are never overwritten.</div>
 </section>
 {{end}}
